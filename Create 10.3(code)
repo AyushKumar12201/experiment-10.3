@@ -1,0 +1,257 @@
+const express = require("express");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const path = require("path");
+const app = express();
+app.use(express.json());
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || "change_this_secret";
+
+const users = [];
+const posts = [];
+
+function id(prefix="id"){return prefix + "_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2,9)}
+async function hash(p){return await bcrypt.hash(p,10)}
+async function cmp(p,h){return await bcrypt.compare(p,h)}
+function genToken(u){return jwt.sign({id:u.id,username:u.username},JWT_SECRET,{expiresIn:"8h"})}
+function auth(req,res,next){
+  const h = req.headers.authorization;
+  if(!h) return res.status(401).json({error:"auth required"});
+  const parts = h.split(" ");
+  if(parts.length!==2) return res.status(401).json({error:"invalid auth"});
+  jwt.verify(parts[1],JWT_SECRET,(err,payload)=>{
+    if(err) return res.status(403).json({error:"invalid token"});
+    req.user = payload;
+    next();
+  });
+}
+
+app.post("/api/register", async (req,res)=>{
+  const {username,password,bio,avatar} = req.body;
+  if(!username||!password) return res.status(400).json({error:"username/password required"});
+  if(users.find(u=>u.username===username)) return res.status(409).json({error:"username taken"});
+  const u = {id:id("u"),username,passwordHash:await hash(password),bio:bio||"",avatar:avatar||"",createdAt:new Date().toISOString()};
+  users.push(u);
+  const token = genToken(u);
+  res.json({token,id:u.id,username:u.username,bio:u.bio,avatar:u.avatar});
+});
+
+app.post("/api/login", async (req,res)=>{
+  const {username,password} = req.body;
+  if(!username||!password) return res.status(400).json({error:"username/password required"});
+  const u = users.find(x=>x.username===username);
+  if(!u) return res.status(401).json({error:"invalid credentials"});
+  const ok = await cmp(password,u.passwordHash);
+  if(!ok) return res.status(401).json({error:"invalid credentials"});
+  const token = genToken(u);
+  res.json({token,id:u.id,username:u.username,bio:u.bio,avatar:u.avatar});
+});
+
+app.get("/api/me", auth, (req,res)=>{
+  const u = users.find(x=>x.id===req.user.id);
+  if(!u) return res.status(404).json({error:"not found"});
+  res.json({id:u.id,username:u.username,bio:u.bio,avatar:u.avatar,createdAt:u.createdAt});
+});
+
+app.post("/api/posts", auth, (req,res)=>{
+  const {title,content} = req.body;
+  if(!title||!content) return res.status(400).json({error:"title/content required"});
+  const author = users.find(u=>u.id===req.user.id);
+  if(!author) return res.status(404).json({error:"author not found"});
+  const p = {id:id("p"),title,content,authorId:author.id,authorName:author.username,avatar:author.avatar,likes:[],comments:[],createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+  posts.unshift(p);
+  res.status(201).json(p);
+});
+
+app.get("/api/posts", (req,res)=>{
+  const summary = posts.map(p=>({id:p.id,title:p.title,authorName:p.authorName,avatar:p.avatar,likes:p.likes.length,comments:p.comments.length,createdAt:p.createdAt}));
+  res.json(summary);
+});
+
+app.get("/api/posts/:id", (req,res)=>{
+  const p = posts.find(x=>x.id===req.params.id);
+  if(!p) return res.status(404).json({error:"post not found"});
+  res.json(p);
+});
+
+app.put("/api/posts/:id", auth, (req,res)=>{
+  const p = posts.find(x=>x.id===req.params.id);
+  if(!p) return res.status(404).json({error:"post not found"});
+  if(p.authorId!==req.user.id) return res.status(403).json({error:"only author can edit"});
+  const {title,content} = req.body;
+  if(title) p.title = title;
+  if(content) p.content = content;
+  p.updatedAt = new Date().toISOString();
+  res.json(p);
+});
+
+app.delete("/api/posts/:id", auth, (req,res)=>{
+  const idx = posts.findIndex(x=>x.id===req.params.id);
+  if(idx===-1) return res.status(404).json({error:"post not found"});
+  if(posts[idx].authorId!==req.user.id) return res.status(403).json({error:"only author can delete"});
+  posts.splice(idx,1);
+  res.json({message:"deleted"});
+});
+
+app.post("/api/posts/:id/comments", auth, (req,res)=>{
+  const p = posts.find(x=>x.id===req.params.id);
+  if(!p) return res.status(404).json({error:"post not found"});
+  const {content} = req.body;
+  if(!content) return res.status(400).json({error:"content required"});
+  const u = users.find(x=>x.id===req.user.id);
+  const c = {id:id("c"),content,authorId:u.id,authorName:u.username,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+  p.comments.push(c);
+  res.status(201).json(c);
+});
+
+app.delete("/api/posts/:postId/comments/:commentId", auth, (req,res)=>{
+  const p = posts.find(x=>x.id===req.params.postId);
+  if(!p) return res.status(404).json({error:"post not found"});
+  const ci = p.comments.findIndex(c=>c.id===req.params.commentId);
+  if(ci===-1) return res.status(404).json({error:"comment not found"});
+  if(p.comments[ci].authorId!==req.user.id && p.authorId!==req.user.id) return res.status(403).json({error:"only comment author or post author can delete"});
+  p.comments.splice(ci,1);
+  res.json({message:"comment deleted"});
+});
+
+app.post("/api/posts/:id/like", auth, (req,res)=>{
+  const p = posts.find(x=>x.id===req.params.id);
+  if(!p) return res.status(404).json({error:"post not found"});
+  const uid = req.user.id;
+  const exists = p.likes.indexOf(uid);
+  if(exists===-1){p.likes.push(uid); return res.json({liked:true,likes:p.likes.length})}
+  p.likes.splice(exists,1);
+  res.json({liked:false,likes:p.likes.length});
+});
+
+app.get("/api/users/:id/posts", (req,res)=>{
+  const userPosts = posts.filter(p=>p.authorId===req.params.id).map(p=>({id:p.id,title:p.title,createdAt:p.createdAt,comments:p.comments.length,likes:p.likes.length}));
+  res.json(userPosts);
+});
+
+const frontend = `
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Social Mini</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;background:#f5f7fb;margin:0;padding:0}
+.container{max-width:900px;margin:20px auto;padding:20px;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.06)}
+.header{display:flex;justify-content:space-between;align-items:center}
+button{cursor:pointer}
+input,textarea{width:100%;padding:8px;margin:6px 0;border:1px solid #ddd;border-radius:4px}
+.post{border-bottom:1px solid #eee;padding:12px 0}
+.avatar{width:36px;height:36px;border-radius:50%;background:#ddd;display:inline-block;vertical-align:middle;margin-right:8px}
+.meta{color:#666;font-size:13px}
+.actions button{margin-right:8px}
+.form-row{display:flex;gap:8px}
+.form-row > *{flex:1}
+.notice{color:#d00}
+</style>
+</head>
+<body>
+<div class="container" id="app"></div>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script>
+const e = React.createElement;
+const useState = React.useState;
+const useEffect = React.useEffect;
+
+function api(path, opts){return fetch('/api'+path, opts).then(r=>r.json())}
+
+function App(){
+  const [token,setToken] = useState(localStorage.getItem('token')||'');
+  const [me,setMe] = useState(null);
+  const [posts,setPosts] = useState([]);
+  const [loading,setLoading] = useState(false);
+  const [notice,setNotice] = useState('');
+
+  useEffect(()=>{loadPosts(); if(token) loadMe();},[]);
+
+  function headers(){return token?{'Content-Type':'application/json','Authorization':'Bearer '+token}:{'Content-Type':'application/json'}}
+
+  function loadPosts(){setLoading(true); fetch('/api/posts').then(r=>r.json()).then(d=>{setPosts(d);setLoading(false)}).catch(()=>setLoading(false))}
+
+  function loadMe(){fetch('/api/me',{headers:{'Authorization':'Bearer '+token}}).then(r=>r.json()).then(d=>{if(d.error){setToken('');localStorage.removeItem('token');setMe(null)}else setMe(d)}).catch(()=>{})}
+
+  function register(username,password){fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})}).then(r=>r.json()).then(d=>{if(d.token){setToken(d.token);localStorage.setItem('token',d.token);loadMe();setNotice('Registered and logged in')}}).catch(()=>{})}
+
+  function login(username,password){fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})}).then(r=>r.json()).then(d=>{if(d.token){setToken(d.token);localStorage.setItem('token',d.token);loadMe();setNotice('Logged in')}}).catch(()=>{})}
+
+  function logout(){setToken('');localStorage.removeItem('token');setMe(null);setNotice('Logged out')}
+
+  function createPost(title,content,cb){fetch('/api/posts',{method:'POST',headers:headers(),body:JSON.stringify({title,content})}).then(r=>r.json()).then(d=>{loadPosts(); if(cb)cb();}).catch(()=>{})}
+
+  function like(id){fetch('/api/posts/'+id+'/like',{method:'POST',headers:headers()}).then(r=>r.json()).then(()=>loadPosts()).catch(()=>{})}
+
+  function viewPost(id){fetch('/api/posts/'+id).then(r=>r.json()).then(d=>alert(JSON.stringify(d, null, 2))).catch(()=>{})}
+
+  return e('div',null,
+    e('div',{className:'header'},
+      e('h2',null,'Social Mini'),
+      e('div',null,
+        me? e('span',null, 'Hi ' + me.username + ' ', e('button',{onClick:logout},'Logout')) :
+        e(AuthForm,{onRegister:register,onLogin:login,notice:setNotice})
+      )
+    ),
+    e('div',{style:{marginTop:12}}, notice && e('div',{className:'notice'},notice)),
+    e(PostComposer,{onCreate:createPost,me:me}),
+    loading? e('div',null,'Loading...') :
+    e('div',null, posts.map(p=> e('div',{key:p.id,className:'post'},
+      e('div',null,
+        e('span',{className:'avatar'}), e('strong',null,' ' + p.title)
+      ),
+      e('div',{className:'meta'},'by ' + p.authorName + ' · ' + new Date(p.createdAt).toLocaleString()),
+      e('div',{style:{marginTop:8}}, e('div',null,'Likes: ' + p.likes + ' · Comments: ' + p.commentsCount)),
+      e('div',{className:'actions'},
+        e('button',{onClick:()=>viewPost(p.id)},'View'),
+        e('button',{onClick:()=>{ if(!token){setNotice('Login required'); return} like(p.id)}},'Like'),
+        e('button',{onClick:()=>{ navigator.clipboard.writeText(location.origin + '/?post='+p.id); setNotice('Link copied') }},'Share')
+      )
+    )) )
+  );
+}
+
+function AuthForm({onRegister,onLogin,notice}){
+  const [u,setU] = useState('');
+  const [p,setP] = useState('');
+  return e('div',null,
+    e('input',{placeholder:'username',value:u,onChange:e=>setU(e.target.value)}),
+    e('input',{placeholder:'password',type:'password',value:p,onChange:e=>setP(e.target.value)}),
+    e('div',null,
+      e('button',{onClick:()=>onLogin(u,p)},'Login'),
+      e('button',{onClick:()=>onRegister(u,p)},'Register')
+    )
+  );
+}
+
+function PostComposer({onCreate,me}){
+  const [title,setTitle] = useState('');
+  const [content,setContent] = useState('');
+  function submit(){
+    if(!me){ alert('login required'); return }
+    if(!title||!content) return;
+    onCreate(title,content,()=>{setTitle('');setContent('')});
+  }
+  return e('div',null,
+    e('h3',null,'Create Post'),
+    e('input',{placeholder:'Title',value:title,onChange:e=>setTitle(e.target.value)}),
+    e('textarea',{placeholder:'Write something...',value:content,onChange:e=>setContent(e.target.value)}),
+    e('div',null, e('button',{onClick:submit},'Post'))
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('app'));
+root.render(e(App));
+</script>
+</body>
+</html>
+`;
+
+app.get("/", (req,res)=>{res.send(frontend)});
+app.use(express.static(path.join(__dirname, "public")));
+
+app.listen(PORT, ()=>{console.log("server on "+PORT)});
